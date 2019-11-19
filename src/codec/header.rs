@@ -1,7 +1,7 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use crate::error::*;
-use std::collections::HashMap;
 use std::io;
+use crate::client::FromMemcacheValue;
 
 #[allow(dead_code)]
 pub enum Opcode {
@@ -98,11 +98,10 @@ impl PacketHeader {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use crate::codec::header::*;
-    use std::io::{Bytes, BufWriter, BufReader, Write};
-    use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 
     #[test]
     fn test_packet_header_read_write() {
@@ -112,7 +111,7 @@ mod tests {
             ..Default::default()
         };
         let mut v: Vec<u8> = Vec::with_capacity(32);
-        header.write(&mut v);
+        header.write(&mut v).unwrap();
         let mut slice: &[u8] = v.as_mut_slice();
         let res = PacketHeader::read(&mut slice);
         assert_eq!(true, res.is_ok());

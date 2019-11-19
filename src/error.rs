@@ -7,9 +7,9 @@ error_chain! {
     }
 
     errors {
-        MemcacheError(errorCode: u16) {
+        MemcacheError(error_code: u16) {
             description("An error was returned by the server")
-            display("Error code: '{}'", errorCode)
+            display("Error code: '{}'", error_code)
         }
 
         ClientError(error: String) {

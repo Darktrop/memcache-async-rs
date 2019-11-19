@@ -1,86 +1,25 @@
-use byteorder::{BigEndian, ByteOrder, WriteBytesExt};
 use tokio::net::TcpStream;
 use crate::error::*;
-use std::collections::{HashMap, VecDeque};
-use std::collections::hash_map::Entry;
-use tokio::stream::Stream;
-use tokio::sync::{oneshot, Mutex};
-use tokio::io::{AsyncWriteExt, AsyncReadExt, AsyncRead, AsyncWrite};
 use futures::prelude::*;
-use futures::{Future, FutureExt};
-use futures::{Poll, StreamExt};
-use futures::future::Ready;
+use futures::Future;
+use futures::Poll;
 use std::pin::Pin;
 use futures::task::Context;
-use std::collections::LinkedList;
-use std::u16;
 use std::sync::atomic::{AtomicU16, Ordering};
-use tokio::net::tcp::split::{WriteHalf, ReadHalf};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver, Receiver, Sender};
-use std::ops::DerefMut;
-use std::sync::Arc;
-use rand::random;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender, UnboundedReceiver};
+use crate::transport::request::*;
+use crate::transport::tagstore::*;
 
-struct Request {
-    data: Vec<u8>,
-    tx: UnboundedSender<ResponseChunk>
-}
+pub enum Transport{}
 
-struct RequestCallback {
-    tag: u16,
-    sent: Option<u16>,
-    total: Option<u16>,
-    tx: UnboundedSender<ResponseChunk>
-}
-
-pub struct ResponseChunk {
-    tag: u16,
-    pub part: u16,
-    pub total: u16,
-    pub data: Vec<u8>
-}
-
-struct TagStore {
-    hash_map: HashMap<u16, RequestCallback>
-}
-
-impl TagStore {
-    fn new(capacity: usize) -> Self {
-        TagStore {
-            hash_map: HashMap::with_capacity(capacity)
-        }
-    }
-
-    fn is_empty(&self) -> bool {
-        self.hash_map.is_empty()
-    }
-
-    fn add(&mut self, req: RequestCallback) {
-        self.hash_map.insert(req.tag, req);
-    }
-
-    pub fn add_response(&mut self, chunk: ResponseChunk) -> Result<()> {
-        match self.hash_map.entry(chunk.tag) {
-            Entry::Occupied(mut v) => {
-                let callback = v.get_mut();
-                callback.sent = Some(callback.sent.unwrap_or(0) + 1);
-                if callback.total.is_none() {
-                    callback.total = Some(chunk.total);
-                }
-                if let Err(_) = callback.tx.try_send(chunk) {
-                    trace!("Client closed channel");
-                    v.remove();
-                } else {
-                    if callback.total.unwrap() == callback.sent.unwrap() {
-                        v.remove();
-                    }
-                }
-                Ok(())
-            },
-            Entry::Vacant(_) => {
-                return Err(ErrorKind::ClientError(format!("Received result for non existing tag {}", chunk.tag)).into())
-            },
-        }
+impl Transport {
+    pub async fn tcp_connect(address: String) -> Result<(TransportFuture<TcpStream>, TransportClient)>
+    {
+        let stream = TcpStream::connect(address).await?;
+        let (tx ,rx) = tokio::sync::mpsc::unbounded_channel();
+        let fut = TransportFuture::new(rx, stream);
+        Ok((fut, TransportClient::new(tx)))
     }
 }
 
@@ -116,19 +55,21 @@ enum TransportState {
     WritingToBuffer
 }
 
-pub struct TransportFuture {
+pub struct TransportFuture<S> {
     rx: UnboundedReceiver<Request>,
     request_id: AtomicU16,
     response_id: AtomicU16,
-    stream: TcpStream,
+    stream: S,
     tag_store: TagStore,
     state: TransportState,
     write_buffer: Vec<u8>,
     read_buffer: Vec<u8>
 }
 
-impl TransportFuture {
-    fn new(rx: UnboundedReceiver<Request>, stream: TcpStream) -> Self {
+impl<S> TransportFuture<S>
+where S: AsyncRead + AsyncWrite + Unpin
+{
+    fn new(rx: UnboundedReceiver<Request>, stream: S) -> Self {
         TransportFuture {
             rx,
             request_id: AtomicU16::new(1),
@@ -143,10 +84,6 @@ impl TransportFuture {
     fn write_request(&mut self, req: Request) -> Result<()> {
         let request_id = self.request_id.fetch_add(1, Ordering::SeqCst);
         trace!("write_request: id: {}", request_id);
-        //self.write_buffer.write_u16::<BigEndian>(request_id)?;
-        //self.write_buffer.write_u16::<BigEndian>(0)?;
-        //self.write_buffer.write_u16::<BigEndian>(1)?;
-        //self.write_buffer.write_u16::<BigEndian>(0)?;
         self.write_buffer.extend_from_slice(&req.data);
         self.tag_store.add(RequestCallback {
             tx: req.tx,
@@ -177,17 +114,32 @@ impl TransportFuture {
 
     fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         trace!("poll_write: buffer size: {}", self.write_buffer.len());
-        let poll = Pin::new(&mut self.stream).poll_write(cx, &mut self.write_buffer);
+        let poll = Pin::new(&mut self.stream).poll_write(cx, &self.write_buffer);
         match poll {
             Poll::Ready(Ok(bytes_written)) => {
                 trace!("poll_write: written {}", bytes_written);
                 self.write_buffer.clear();
-                self.state = TransportState::Pending;
                 Poll::Ready(Ok(()))
             }
             Poll::Ready(Err(e)) => {
                 Poll::Ready(Err(From::from(e)))
             }
+            Poll::Pending => {
+                Poll::Pending
+            }
+        }
+    }
+
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
+        let poll = Pin::new(&mut self.stream).poll_flush(cx);
+        match poll {
+            Poll::Ready(Ok(_)) => {
+                self.state = TransportState::Pending;
+                Poll::Ready(Ok(()))
+            },
+            Poll::Ready(Err(e)) => {
+                Poll::Ready(Err(From::from(e)))
+            },
             Poll::Pending => {
                 Poll::Pending
             }
@@ -229,7 +181,9 @@ impl TransportFuture {
     }
 }
 
-impl Future for TransportFuture {
+impl<S> Future for TransportFuture<S>
+where S: AsyncRead + AsyncWrite + Unpin
+{
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -290,27 +244,22 @@ impl Future for TransportFuture {
                             return Poll::Pending;
                         },
                     }
+                    trace!("poll_flush: start");
+                    match me.poll_flush(cx) {
+                        Poll::Ready(Ok(_)) => {
+                            trace!("poll_flush: done (ok)");
+                        },
+                        Poll::Ready(Err(e)) => {
+                            return Poll::Ready(Err(e))
+                        },
+                        Poll::Pending => {
+                            trace!("poll_flush: done (pending)");
+                            return Poll::Pending;
+                        },
+                    }
                 }
             }
             trace!("end state: {:?}", me.state);
         }
     }
-}
-
-pub struct Transport
-{
-}
-
-impl Transport {
-    pub async fn connect(address: String) -> Result<(TransportFuture, TransportClient)>
-    {
-        let mut stream = TcpStream::connect(address).await?;
-        let (tx ,rx) = tokio::sync::mpsc::unbounded_channel();
-        let fut = TransportFuture::new(rx, stream);
-        Ok((fut, TransportClient::new(tx)))
-    }
-}
-
-pub struct ResponseStream {
-    pub rx: UnboundedReceiver<ResponseChunk>
 }
